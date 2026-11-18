@@ -4,10 +4,18 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from .compression import (
+    NoFeasibleCandidate,
+    compress,
+    to_feature_collection,
+    total_vertices,
+)
 from .config import settings
 from .db import Database, VersionConflict, VersionNotFound
 from .geometry import GeometryError, classify_point, parse_surface, validate_submission
 from .schemas import (
+    CompressRequest,
+    CompressResponse,
     PointResult,
     PublishRequest,
     PublishResponse,
@@ -20,9 +28,10 @@ app = FastAPI(
     title="流域防汛网格服务",
     description=(
         "提交流域多边形与整版网格（互不重叠且恰好覆盖流域），按所见版号乐观锁发布；"
-        "观测点按固定版号批量落格，旧版持久保留可查。"
+        "观测点按固定版号批量落格，旧版持久保留可查；"
+        "对已发布版按候选容差压缩网格顶点，压缩前后落格结论保持一致。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 db = Database(settings.database_path)
@@ -148,3 +157,57 @@ async def query(req: QueryRequest) -> JSONResponse | QueryResponse:
         )
 
     return QueryResponse(version=version, is_current=(version == current), results=results)
+
+
+@app.post(
+    "/compress",
+    response_model=CompressResponse,
+    tags=["压缩"],
+    responses={
+        404: {"model": dict, "description": "指定版本不存在"},
+        422: {"model": dict, "description": "没有满足全部限制的候选，不返回部分网格"},
+    },
+)
+async def compress_grids(req: CompressRequest) -> JSONResponse | CompressResponse:
+    """压缩已发布版网格顶点，保持覆盖关系与参照点落格结论不变。
+
+    只读接口：不发布新版本，原版与当前版均不改动。
+    """
+    if not any(v["version"] == req.version for v in db.list_versions()):
+        return _error(404, "VERSION_NOT_FOUND", f"版本 {req.version} 不存在")
+
+    watershed, grids = db.load_snapshot(req.version)
+    points = [p.model_dump() for p in req.reference_points]
+
+    try:
+        new_grids, best, candidates = compress(
+            watershed,
+            grids,
+            tolerances=req.tolerances,
+            max_total_vertices=req.max_total_vertices,
+            max_rel_area_dev=req.max_rel_area_dev,
+            reference_points=points,
+            area_tol_rel=settings.area_tol_rel,
+            point_eps_rel=settings.point_eps_rel,
+        )
+    except NoFeasibleCandidate as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "NO_FEASIBLE_CANDIDATE",
+                "detail": str(exc),
+                "source_version": req.version,
+                "vertices_before": exc.original_total,
+                "candidates": [c.as_dict() for c in exc.candidates],
+            },
+        )
+
+    return CompressResponse(
+        source_version=req.version,
+        candidate_tolerance=best.tolerance,
+        vertices_before=total_vertices(grids),
+        vertices_after=best.vertex_count,
+        grid_count=len(new_grids),
+        geojson=to_feature_collection(new_grids),
+        candidates=[c.as_dict() for c in candidates],
+    )

@@ -1,9 +1,10 @@
 """请求 / 响应 Pydantic 模型。"""
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 # 状态码：inside 内部点 / boundary 边界待判 / outside 流域外
 PointStatus = Literal["inside", "boundary", "outside"]
@@ -81,3 +82,89 @@ class VersionInfo(BaseModel):
     expected_version: int | None
     published_at: str
     grid_count: int
+
+
+# ---- 网格压缩 ---------------------------------------------------------
+
+
+class CompressPoint(BaseModel):
+    point_id: str | None = Field(None, max_length=128, description="参照点编号，可选")
+    lon: float = Field(..., allow_inf_nan=False, description="经度（或平面坐标 x）")
+    lat: float = Field(..., allow_inf_nan=False, description="纬度（或平面坐标 y）")
+
+
+class CompressRequest(BaseModel):
+    """压缩请求；字段名同时接受常见同义写法（source_version / max_vertices 等）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    version: int = Field(
+        ...,
+        ge=1,
+        validation_alias=AliasChoices("version", "source_version"),
+        description="要压缩的已发布版号",
+    )
+    tolerances: list[float] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        validation_alias=AliasChoices(
+            "tolerances", "candidate_tolerances", "candidate_tolerance"
+        ),
+        description="2~8 个候选简化容差，须为大于 0 的数值",
+    )
+    max_total_vertices: int = Field(
+        ...,
+        ge=0,
+        validation_alias=AliasChoices(
+            "max_total_vertices", "max_vertices", "vertex_limit", "max_vertex_count"
+        ),
+        description="压缩后整版网格顶点总数上限",
+    )
+    max_rel_area_dev: float = Field(
+        ...,
+        ge=0,
+        validation_alias=AliasChoices(
+            "max_rel_area_dev",
+            "max_area_deviation",
+            "max_relative_area_deviation",
+            "area_deviation",
+        ),
+        description="每个网格相对原版面积允许的最大偏差（绝对值比例，如 0.05 表示 5%）",
+    )
+    reference_points: list[CompressPoint] = Field(
+        default_factory=list,
+        max_length=100,
+        validation_alias=AliasChoices("reference_points", "ref_points", "points"),
+        description="至多 100 个参照点，压缩前后落格结论必须一致",
+    )
+
+    @field_validator("tolerances")
+    @classmethod
+    def _positive_tolerances(cls, value: list[float]) -> list[float]:
+        if any(not math.isfinite(t) or t <= 0 for t in value):
+            raise ValueError("候选容差必须是大于 0 的有限数值")
+        return value
+
+
+class CandidateStatus(BaseModel):
+    tolerance: float
+    status: Literal["feasible", "rejected"]
+    vertex_count: int | None = Field(
+        None, description="该候选压缩后的顶点总数；未能完成构建时为 null"
+    )
+    reason: str | None = Field(None, description="被否决的原因码")
+    detail: str | None = Field(None, description="被否决的说明")
+
+
+class CompressResponse(BaseModel):
+    status: Literal["compressed"] = "compressed"
+    source_version: int = Field(..., description="压缩所依据的已发布版号")
+    candidate_tolerance: float = Field(..., description="最终选中的候选容差")
+    vertices_before: int
+    vertices_after: int
+    grid_count: int
+    geojson: dict[str, Any] = Field(..., description="压缩后的网格 FeatureCollection")
+    candidates: list[CandidateStatus] = Field(
+        default_factory=list, description="全部候选容差的评估结果"
+    )

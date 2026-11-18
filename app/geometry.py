@@ -1,6 +1,7 @@
 """Shapely 几何处理：整版网格校验与观测点落格判定。"""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from shapely.geometry import shape, Point
@@ -133,6 +134,8 @@ def _make_point(lon: Any, lat: Any) -> Point:
         raise GeometryError(f"观测点坐标必须是数字，收到 {lon!r}, {lat!r}") from exc
     if not point.is_valid:
         raise GeometryError("观测点不是合法的点几何")
+    if not (math.isfinite(point.x) and math.isfinite(point.y)):
+        raise GeometryError(f"观测点坐标必须是有限数值，收到 {lon!r}, {lat!r}")
     return point
 
 
